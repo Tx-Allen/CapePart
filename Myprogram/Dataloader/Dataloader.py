@@ -1,7 +1,7 @@
 import json  # 导入JSON工具，用于读取episode标注
 import os  # 提供路径拼接与文件存在性检查
 import random  # 用于随机抽取episode和样本
-from typing import List, Tuple  # 类型注解，描述列表和元组
+from typing import Any, Dict, List, Optional, Set, Tuple  # 类型注解，描述列表、字典和元组
 from collections import defaultdict  # 以子类为单位聚合episodes
 from pathlib import Path  # 从路径推断子类名称
 
@@ -447,11 +447,17 @@ class FewShotSegmentationDataset(Dataset):
     def __getitem__(self, idx: int):
         if self.is_train:
             episode = self.train_episode_pool[idx]  # 直接按索引取出对应episode，确保覆盖完整子类
-            # 训练模式：仅随机取一对 support/query
-            support_entry = random.choice(episode['support'])
-            query_entry = random.choice(episode['query'])
-            support_entries = [support_entry]
-            query_entries = [query_entry]
+            support_entries = self._sample_entries(
+                episode['support'],
+                self.num_shots,
+                randomize=True,
+            )
+            query_entries = self._sample_entries(
+                episode['query'],
+                self.num_queries,
+                randomize=True,
+                use_all=self.use_all_queries,
+            )
         else:
             episode = self.eval_episodes[idx]
             support_entries = self._sample_entries(
@@ -474,71 +480,25 @@ class FewShotSegmentationDataset(Dataset):
         support_images, support_masks = self._load_batch(support_entries, label='support')  # 加载支持集图像与掩码
         query_images, query_masks = self._load_batch(query_entries, label='query')  # 加载查询集图像与掩码
 
-        support_part_names = (support_entries[0].get('part_names') or []) if support_entries else []
-        query_part_names = (query_entries[0].get('part_names') or []) if query_entries else []
         support_image_names = [Path(entry['image']).name for entry in support_entries]
         query_image_names = [Path(entry['image']).name for entry in query_entries]
 
-        def resolve_part_names(indices, name_pool):
-            resolved = []
-            for part_idx in indices:
-                if name_pool and part_idx < len(name_pool):
-                    resolved.append(name_pool[part_idx])
-                else:
-                    resolved.append(f'part_{part_idx}')
-            return resolved
+        support_part_meta = self._extract_part_names(support_entries, support_masks.shape[1])
+        query_part_meta = self._extract_part_names(query_entries, query_masks.shape[1])
 
-        support_parts = support_masks.shape[1]
-        query_parts = query_masks.shape[1]
-        info = {
-            'support_parts': support_parts,
-            'query_parts_before': query_parts,
-            'padding_applied': False,
-            'trimmed_indices': [],
-            'padded_indices': [],
-            'padded_names': [],
-            'trimmed_names': [],
-        }
-
-        if query_parts != support_parts:
-            info['padding_applied'] = True
-            if query_parts < support_parts:
-                pad = support_parts - query_parts
-                pad_shape = list(query_masks.shape)
-                pad_shape[1] = pad
-                pad_tensor = torch.zeros(pad_shape, dtype=query_masks.dtype)
-                query_masks = torch.cat([query_masks, pad_tensor], dim=1)
-                padded_indices = list(range(query_parts, support_parts))
-                padded_names = resolve_part_names(padded_indices, support_part_names)
-                info['padded_indices'] = padded_indices
-                info['padded_names'] = padded_names
-                print(
-                    f"[WARN] query masks have {query_parts} parts < support {support_parts}; padding {pad} zero channels."
-                )
-                print(
-                    f"[INFO] Episode {episode['episode_id']} padded query zero masks for indices {padded_indices}"
-                    f" ({', '.join(padded_names) if padded_names else 'no part names'}) to match support."
-                    f" Support: {support_image_names}, Query: {query_image_names}"
-                )
-            elif query_parts > support_parts:
-                trimmed = list(range(support_parts, query_parts))
-                info['trimmed_indices'] = trimmed
-                query_masks = query_masks[:, :support_parts]
-                trimmed_names = resolve_part_names(trimmed, query_part_names)
-                info['trimmed_names'] = trimmed_names
-                print(
-                    f"[WARN] query masks have {query_parts} parts > support {support_parts}; trimming extra indices {trimmed}."
-                )
-                print(
-                    f"[INFO] Episode {episode['episode_id']} trimmed query masks dropping indices {trimmed}"
-                    f" ({', '.join(trimmed_names) if trimmed_names else 'no part names'}) to align with support."
-                    f" Support: {support_image_names}, Query: {query_image_names}"
-                )
-
-        if support_masks.shape[1] != query_masks.shape[1]:
-            raise RuntimeError(
-                f"Support/query part mismatch after adjustment: support {support_masks.shape[1]}, query {query_masks.shape[1]}"
-            )
+        (
+            support_masks,
+            query_masks,
+            alignment_info,
+        ) = self._align_support_query_masks(
+            support_masks,
+            query_masks,
+            support_part_meta,
+            query_part_meta,
+            episode_id=episode['episode_id'],
+            support_image_names=support_image_names,
+            query_image_names=query_image_names,
+        )
 
         num_parts = support_masks.shape[1]  # 记录当前episode部件数量，后续模型需要
 
@@ -547,8 +507,8 @@ class FewShotSegmentationDataset(Dataset):
             'support_paths': [entry['image'] for entry in support_entries],
             'query_paths': [entry['image'] for entry in query_entries],
             'num_parts': num_parts,
-            'part_names': support_entries[0].get('part_names') or [],
-            'part_alignment': info,
+            'part_names': alignment_info['part_names'],
+            'part_alignment': alignment_info,
         }
 
         return {  # 返回模型训练所需的张量与元数据
@@ -579,7 +539,7 @@ class FewShotSegmentationDataset(Dataset):
 
     def _load_mask_images(self, entry: dict):
         mask_paths = entry.get('masks') or []
-        mask_mode = entry.get('mask_mode', 'multi_file')
+        mask_mode = entry.get('mask_mode', 'multi_channel')
         if mask_mode == 'multi_channel':
             if not mask_paths:
                 raise ValueError(f"Entry {entry['image']} missing multi-channel mask path")
@@ -657,10 +617,229 @@ class FewShotSegmentationDataset(Dataset):
 
         images_tensor = torch.stack(images)
         masks_tensor = torch.stack(masks)
-        if self.is_train:
-            images_tensor = images_tensor[:1]
-            masks_tensor = masks_tensor[:1]
         return images_tensor, masks_tensor
+
+    def _extract_part_names(self, entries: List[dict], part_count: int) -> Dict[str, Any]:
+        """提取部件名称并补齐长度，返回唯一名称及显示名称映射。"""
+
+        if part_count <= 0:
+            return {'names': [], 'display_map': {}, 'provided_flags': []}
+
+        raw_names: List[str] = []
+        for entry in entries:
+            names = entry.get('part_names') or []
+            if names:
+                raw_names = [name.strip() for name in names]
+                break
+
+        canonical_names: List[str] = []
+        provided_flags: List[bool] = []
+        for idx in range(part_count):
+            if idx < len(raw_names) and raw_names[idx]:
+                base_name = raw_names[idx]
+                provided_flags.append(True)
+            else:
+                base_name = f'part_{idx}'
+                provided_flags.append(False)
+            canonical_names.append(base_name)
+
+        unique_names: List[str] = []
+        display_map: Dict[str, str] = {}
+        unique_flags: List[bool] = []
+        seen: Dict[str, int] = {}
+        for idx, base_name in enumerate(canonical_names):
+            occurrence = seen.get(base_name, 0)
+            seen[base_name] = occurrence + 1
+            if occurrence == 0:
+                unique = base_name
+            else:
+                unique = f'{base_name}#{occurrence}'
+            unique_names.append(unique)
+            display_map[unique] = base_name
+            unique_flags.append(provided_flags[idx])
+
+        return {
+            'names': unique_names,
+            'display_map': display_map,
+            'provided_flags': unique_flags,
+        }
+
+    def _align_support_query_masks(
+        self,
+        support_masks: torch.Tensor,
+        query_masks: torch.Tensor,
+        support_part_meta: Dict[str, Any],
+        query_part_meta: Dict[str, Any],
+        *,
+        episode_id: str,
+        support_image_names: List[str],
+        query_image_names: List[str],
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
+        """对齐support/query的掩码通道，确保两侧具有一致的部件集合。"""
+
+        support_names = support_part_meta['names']
+        query_names = query_part_meta['names']
+        support_flags = support_part_meta.get('provided_flags', [True] * len(support_names))
+        query_flags = query_part_meta.get('provided_flags', [True] * len(query_names))
+
+        support_count = support_masks.shape[1]
+        query_count = query_masks.shape[1]
+        min_count = min(support_count, query_count)
+
+        support_keys: List[Tuple[str, Any]] = []
+        query_keys: List[Tuple[str, Any]] = []
+
+        for idx in range(min_count):
+            support_has_name = idx < len(support_flags) and support_flags[idx]
+            query_has_name = idx < len(query_flags) and query_flags[idx]
+            if support_has_name and query_has_name:
+                support_keys.append(('name', support_names[idx]))
+                query_keys.append(('name', query_names[idx]))
+            else:
+                support_keys.append(('index', idx))
+                query_keys.append(('index', idx))
+
+        for idx in range(min_count, support_count):
+            if idx < len(support_flags) and support_flags[idx]:
+                support_keys.append(('name', support_names[idx]))
+            else:
+                support_keys.append(('index', idx))
+
+        for idx in range(min_count, query_count):
+            if idx < len(query_flags) and query_flags[idx]:
+                query_keys.append(('name', query_names[idx]))
+            else:
+                query_keys.append(('index', idx))
+
+        union_keys: List[Tuple[str, Any]] = []
+        seen_keys: Set[Tuple[str, Any]] = set()
+
+        def _register_key(key: Tuple[str, Any]):
+            if key not in seen_keys:
+                union_keys.append(key)
+                seen_keys.add(key)
+
+        for key in support_keys:
+            _register_key(key)
+        for key in query_keys:
+            _register_key(key)
+
+        if not union_keys:
+            raise ValueError(
+                f"Episode {episode_id} has no valid part channels in support/query masks."
+            )
+
+        support_lookup = {name: idx for idx, name in enumerate(support_names)}
+        query_lookup = {name: idx for idx, name in enumerate(query_names)}
+
+        support_display_map = support_part_meta['display_map']
+        query_display_map = query_part_meta['display_map']
+
+        def _display_for_key(key: Tuple[str, Any]) -> str:
+            kind, value = key
+            if kind == 'name':
+                return support_display_map.get(
+                    value,
+                    query_display_map.get(value, value),
+                )
+            idx = int(value)
+            candidates = []
+            if idx < len(support_names):
+                name = support_names[idx]
+                candidates.append(support_display_map.get(name))
+            if idx < len(query_names):
+                name = query_names[idx]
+                candidates.append(query_display_map.get(name))
+            for candidate in candidates:
+                if candidate:
+                    return candidate
+            return f'part_{idx}'
+
+        support_channels: List[torch.Tensor] = []
+        query_channels: List[torch.Tensor] = []
+        support_missing: List[str] = []
+        query_missing: List[str] = []
+        support_reorder: List[Optional[int]] = []
+        query_reorder: List[Optional[int]] = []
+
+        for key in union_keys:
+            display_name = _display_for_key(key)
+            kind, value = key
+            if kind == 'name' and value in support_lookup:
+                idx = support_lookup[value]
+                support_channels.append(support_masks[:, idx : idx + 1])
+                support_reorder.append(idx)
+            elif kind == 'index' and int(value) < support_count:
+                idx = int(value)
+                support_channels.append(support_masks[:, idx : idx + 1])
+                support_reorder.append(idx)
+            else:
+                support_channels.append(
+                    support_masks.new_zeros(
+                        (support_masks.shape[0], 1, support_masks.shape[2], support_masks.shape[3])
+                    )
+                )
+                support_missing.append(display_name)
+                support_reorder.append(None)
+
+            if kind == 'name' and value in query_lookup:
+                idx = query_lookup[value]
+                query_channels.append(query_masks[:, idx : idx + 1])
+                query_reorder.append(idx)
+            elif kind == 'index' and int(value) < query_count:
+                idx = int(value)
+                query_channels.append(query_masks[:, idx : idx + 1])
+                query_reorder.append(idx)
+            else:
+                query_channels.append(
+                    query_masks.new_zeros(
+                        (query_masks.shape[0], 1, query_masks.shape[2], query_masks.shape[3])
+                    )
+                )
+                query_missing.append(display_name)
+                query_reorder.append(None)
+
+        aligned_support = torch.cat(support_channels, dim=1)
+        aligned_query = torch.cat(query_channels, dim=1)
+
+        if aligned_support.shape[1] != aligned_query.shape[1]:
+            raise RuntimeError(
+                f"Episode {episode_id} alignment failed: support has {aligned_support.shape[1]} parts,"
+                f" query has {aligned_query.shape[1]} parts."
+            )
+
+        union_display_names = [_display_for_key(key) for key in union_keys]
+
+        if support_missing:
+            print(
+                f"[WARN] Episode {episode_id} support lacks parts {support_missing}; padded zero masks to align query."
+                f" Support images: {support_image_names}"
+            )
+        if query_missing:
+            print(
+                f"[WARN] Episode {episode_id} query lacks parts {query_missing}; padded zero masks to align support."
+                f" Query images: {query_image_names}"
+            )
+
+        info = {
+            'support_parts_before': support_masks.shape[1],
+            'query_parts_before': query_masks.shape[1],
+            'part_names': union_display_names,
+            'aligned_parts': aligned_support.shape[1],
+            'support_missing_parts': support_missing,
+            'query_missing_parts': query_missing,
+            'support_reorder_indices': support_reorder,
+            'query_reorder_indices': query_reorder,
+            'alignment_keys': [
+                {
+                    'type': kind,
+                    'value': int(value) if kind == 'index' else value,
+                }
+                for kind, value in union_keys
+            ],
+        }
+
+        return aligned_support, aligned_query, info
 
     # 将掩码图转换为归一化张量
     def _mask_tensor(self, mask: Image.Image) -> torch.Tensor:
