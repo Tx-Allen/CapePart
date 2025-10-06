@@ -56,6 +56,7 @@ _C.MODEL.MASK_DIM = 256  # 预测掩码特征的维度
 _C.MODEL.JOINT_ENCODER_LAYERS = 3  # Query-Support联合精炼编码层数，0表示关闭
 _C.MODEL.USE_MULTISCALE_FUSION = False  # 是否启用多尺度特征融合
 _C.MODEL.MULTISCALE_REFERENCE = 'res5'  # 多尺度融合对齐的参考层
+_C.MODEL.USE_INFO_FUSION = False  # 是否启用InformationFusion模块（通常在第二阶段微调时使用）
 
 # Training -----------------------------------------------------
 _C.TRAIN = CN()  # 训练阶段超参数子节点

@@ -64,6 +64,62 @@ class FewShotSegmentationDataset(Dataset):
               query_0001/part_wing.png
     """
 
+    @staticmethod
+    def build_image_transform(
+        img_size: int,
+        mean: List[float] | Tuple[float, float, float],
+        std: List[float] | Tuple[float, float, float],
+    ) -> transforms.Compose:
+        """Return the default image preprocessing pipeline."""
+
+        return transforms.Compose(
+            [
+                transforms.Resize((img_size, img_size), interpolation=Image.BILINEAR),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=mean, std=std),
+            ]
+        )
+
+    @staticmethod
+    def build_mask_transform(img_size: int) -> transforms.Compose:
+        """Return the default preprocessing pipeline for binary masks."""
+
+        return transforms.Compose(
+            [
+                transforms.Resize((img_size, img_size), interpolation=Image.NEAREST),
+                transforms.PILToTensor(),
+            ]
+        )
+
+    @staticmethod
+    def decode_multi_channel_mask(mask_path: str) -> List[Image.Image]:
+        """Decode a multi-channel PNG mask into a list of binary PIL images."""
+
+        arr = np.array(Image.open(mask_path))
+        channels: List[Image.Image] = []
+
+        if arr.ndim == 2:
+            max_label = int(arr.max())
+            for label in range(max_label + 1):
+                channel = (arr == label).astype(np.uint8) * 255
+                channels.append(Image.fromarray(channel))
+            return channels
+
+        if arr.ndim != 3:
+            raise ValueError(
+                f'Unsupported mask format for {mask_path}, array shape {arr.shape}'
+            )
+
+        for idx in range(arr.shape[2]):
+            channel = arr[..., idx]
+            if channel.dtype != np.uint8:
+                channel = (channel > 0).astype(np.uint8) * 255
+            else:
+                channel = (channel > 0).astype(np.uint8) * 255
+            channels.append(Image.fromarray(channel))
+
+        return channels
+
     # 初始化few-shot分割数据集并建立episode列表
     def __init__(
         self,
@@ -81,13 +137,16 @@ class FewShotSegmentationDataset(Dataset):
     ):
         self.cfg = cfg  # 保存配置引用，便于访问数据及模型参数
         self.root = os.path.abspath(root)  # 将数据根目录转换为绝对路径，便于后续拼接
+        self.root_path = Path(self.root)
         self.split = split  # 记录当前数据划分(train/val/test)，驱动子类拆分逻辑
         self.is_train = is_train  # 标记当前数据集是否用于训练
         self.num_shots = num_shots  # 支持集样本数（shots）
         self.num_queries = num_queries  # 查询集样本数
         self.use_json = bool(getattr(cfg.DATASET, 'USE_JSON', True))  # 标记是否从JSON读取episode
-        self.image_exts = {ext.lower() for ext in getattr(cfg.DATASET, 'IMAGE_EXTS', ['.jpg', '.png', '.jpeg'])}  # 允许的图像后缀
-        self.mask_exts = {ext.lower() for ext in getattr(cfg.DATASET, 'MASK_EXTS', ['.png'])}  # 允许的掩码后缀
+        image_exts = getattr(cfg.DATASET, 'IMAGE_EXTS', ['.jpg', '.png', '.jpeg'])
+        self.image_exts = {ext.lower() for ext in image_exts}  # 允许的图像后缀
+        mask_exts = getattr(cfg.DATASET, 'MASK_EXTS', ['.png'])
+        self.mask_exts = {ext.lower() for ext in mask_exts}  # 允许的掩码后缀
         use_all_query_cfg = getattr(cfg.DATASET, 'USE_ALL_QUERIES', None)  # 读取是否使用全部query的开关
         if use_all_query_cfg is None:  # None表示自动决定
             self.use_all_queries = not self.use_json  # 使用文件夹模式时默认全部query，其余保持原逻辑
@@ -100,6 +159,8 @@ class FewShotSegmentationDataset(Dataset):
 
         self.image_dir = cfg.DATASET.IMAGE_DIR  # 图像目录相对路径
         self.mask_dir = cfg.DATASET.MASK_DIR  # 掩码目录相对路径
+
+        self.split_root = self._resolve_split_root(self.root_path, split)
 
         self.episodes: List[dict] = []
         if self.use_json:
@@ -122,6 +183,12 @@ class FewShotSegmentationDataset(Dataset):
             epi['subclass'] = subclass  # 回写子类信息，后续流程统一使用
             self.subclass_to_episodes[subclass].append(epi)  # 将episode加入对应子类
 
+        if not self.subclass_to_episodes:  # 没有任何有效子类时提前报错，便于排查数据问题
+            raise ValueError(
+                'No valid episodes were found. 请确认标注JSON或数据文件夹中至少包含两个图像来构成'
+                ' 支持/查询对，并且掩码采用受支持的单PNG多通道格式。'
+            )
+
         self.all_subclass_names = sorted(self.subclass_to_episodes.keys())  # 记录所有可用子类
         self.subclass_partitions = self._build_subclass_partitions()  # 基于配置生成train/val子类划分
 
@@ -133,8 +200,14 @@ class FewShotSegmentationDataset(Dataset):
             active_names = self.subclass_partitions.get('test', [])
 
         self.active_subclass_names = list(active_names)  # 存储当前数据集应使用的子类列表
-        if not self.active_subclass_names:  # 若划分为空则直接报错提示配置问题
-            raise ValueError(f'No subclasses assigned to split {self.split}.')
+        if not self.active_subclass_names:  # 若划分为空则尝试兜底使用全部子类
+            if self.all_subclass_names:  # 仍存在合法子类时直接使用全量列表
+                self.active_subclass_names = self.all_subclass_names.copy()
+            else:
+                raise ValueError(
+                    f'No subclasses are available for split {self.split}. '
+                    '请检查标注文件或文件夹结构是否包含至少一个有效子类。'
+                )
         self.active_subclass_to_episodes = {name: self.subclass_to_episodes[name] for name in self.active_subclass_names}  # 构建子类到episode映射
 
         # 评估阶段按照固定顺序遍历当前划分内的episode
@@ -148,22 +221,22 @@ class FewShotSegmentationDataset(Dataset):
             for name in self.active_subclass_names:
                 self.train_episode_pool.extend(self.subclass_to_episodes[name])
             if not self.train_episode_pool:
-                raise ValueError(f'No training episodes found for subclasses {self.active_subclass_names}.')
+                raise ValueError(
+                    f'No training episodes found for subclasses {self.active_subclass_names}.'
+                )
+            self.episodes_per_epoch = self._resolve_episodes_per_epoch(episodes)
+            base_seed = int(getattr(cfg, 'SEED', 0))
+            self._episode_rng = random.Random(base_seed + 1)
         else:
             self.train_episode_pool = None
+            self.episodes_per_epoch = 0
+            self._episode_rng = None
 
         if not self.episodes:  # 没有有效episode时直接报错
             raise ValueError('No valid episodes found in annotation file.')
 
-        self.to_tensor = transforms.Compose([  # 定义图像预处理流水线
-            transforms.Resize((img_size, img_size), interpolation=Image.BILINEAR),  # 缩放图像到固定尺寸
-            transforms.ToTensor(),  # 转成张量并归一化到[0,1]
-            transforms.Normalize(mean=mean, std=std),  # 按ImageNet均值方差标准化
-        ])
-        self.mask_to_tensor = transforms.Compose([  # 定义掩码预处理
-            transforms.Resize((img_size, img_size), interpolation=Image.NEAREST),  # 使用最近邻缩放保持二值属性
-            transforms.PILToTensor(),  # 转成张量但不归一化
-        ])
+        self.to_tensor = self.build_image_transform(img_size, mean, std)
+        self.mask_to_tensor = self.build_mask_transform(img_size)
 
         # 元学习相关的增强配置，用于提升support->query泛化
         aug_cfg = getattr(cfg, 'AUG', None)
@@ -270,6 +343,15 @@ class FewShotSegmentationDataset(Dataset):
                 return candidate
         return os.path.join(self.root, path)  # 都不存在则返回root+原始路径，错误稍后抛出
 
+    def _resolve_split_root(self, root_path: Path, split: str) -> Path:
+        """推断当前数据划分所在的实际目录。"""
+
+        if split and root_path.name != split:
+            candidate = root_path / split
+            if candidate.is_dir():
+                return candidate
+        return root_path
+
     def _resolve_entry(self, item: dict) -> dict:
         resolved = {
             'image': self._resolve_path(item['image'], self.image_dir),  # 解析图像路径
@@ -300,58 +382,78 @@ class FewShotSegmentationDataset(Dataset):
                     return parts[idx - 1]  # 取其上一级目录作为子类名
         return parts[-2] if len(parts) >= 2 else 'default'  # 兜底逻辑
 
+    def _iter_leaf_class_dirs(self, base_dir: Path):
+        """遍历所有包含 images/masks 的叶子子类目录。"""
+
+        seen_dirs: Set[Path] = set()
+        for images_dir in sorted(base_dir.rglob('images')):
+            if not images_dir.is_dir():
+                continue
+            class_dir = images_dir.parent
+            if class_dir in seen_dirs:
+                continue
+            masks_dir = class_dir / 'maks'
+            if not masks_dir.exists():
+                masks_dir = class_dir / 'masks'
+            if not masks_dir.is_dir():
+                continue
+
+            try:
+                rel_parts = class_dir.relative_to(base_dir).parts
+            except ValueError:
+                rel_parts = ()
+
+            if len(rel_parts) >= 2:
+                super_name = rel_parts[-2]
+            elif rel_parts:
+                super_name = base_dir.name
+            else:
+                super_name = class_dir.parent.name if class_dir.parent != class_dir else base_dir.name
+
+            seen_dirs.add(class_dir)
+            yield super_name, class_dir, images_dir, masks_dir
+
     # 从超类/子类文件夹结构自动构造episodes
     def _build_episodes_from_folder(self) -> list:
-        root_dir = Path(self.root)
+        root_dir = self.split_root
         if not root_dir.is_dir():
             raise FileNotFoundError(f'Dataset root {root_dir} not found.')
 
         episodes = []  # 临时保存构造出的episodes
-        for super_dir in sorted(root_dir.iterdir()):
-            if not super_dir.is_dir():
+        for super_name, subclass_dir, images_dir, masks_dir in self._iter_leaf_class_dirs(root_dir):
+            subclass_name = subclass_dir.name
+            image_entries = []
+            for img_path in sorted(images_dir.iterdir()):  # 遍历images目录
+                if not img_path.is_file():
+                    continue
+                if img_path.suffix.lower() not in self.image_exts:
+                    continue
+                mask_info = self._collect_masks_for_image(masks_dir, img_path.stem)
+                if mask_info is None:
+                    continue
+                entry = {
+                    'image': str(img_path),
+                    'masks': mask_info['paths'],
+                    'mask_mode': mask_info['mode'],
+                }
+                if mask_info.get('part_names'):
+                    entry['part_names'] = mask_info['part_names']
+                image_entries.append(entry)
+
+            if len(image_entries) <= 1:
                 continue
-            for subclass_dir in sorted(super_dir.iterdir()):  # 遍历每个子类文件夹
-                if not subclass_dir.is_dir():
-                    continue
-                subclass_name = subclass_dir.name
-                images_dir = subclass_dir / 'images'
-                masks_dir = subclass_dir / 'maks'
-                if not masks_dir.exists():
-                    masks_dir = subclass_dir / 'masks'
-                if not images_dir.is_dir() or not masks_dir.is_dir():
-                    continue
 
-                image_entries = []
-                for img_path in sorted(images_dir.iterdir()):  # 遍历images目录
-                    if not img_path.is_file():
-                        continue
-                    if img_path.suffix.lower() not in self.image_exts:
-                        continue
-                    mask_info = self._collect_masks_for_image(masks_dir, img_path.stem)
-                    if mask_info is None:
-                        continue
-                    entry = {
-                        'image': str(img_path),
-                        'masks': mask_info['paths'],
-                        'mask_mode': mask_info['mode'],
+            prefix = super_name if super_name else subclass_name
+            for idx, support_entry in enumerate(image_entries):
+                query_entries = [image_entries[j] for j in range(len(image_entries)) if j != idx]
+                episodes.append(
+                    {
+                        'episode_id': f'{prefix}_{subclass_name}_{Path(support_entry["image"]).stem}',
+                        'subclass': subclass_name,
+                        'support': [support_entry],
+                        'query': query_entries,
                     }
-                    if mask_info.get('part_names'):
-                        entry['part_names'] = mask_info['part_names']
-                    image_entries.append(entry)
-
-                if len(image_entries) <= 1:
-                    continue
-
-                for idx, support_entry in enumerate(image_entries):
-                    query_entries = [image_entries[j] for j in range(len(image_entries)) if j != idx]
-                    episodes.append(
-                        {
-                            'episode_id': f'{super_dir.name}_{subclass_name}_{Path(support_entry["image"]).stem}',
-                            'subclass': subclass_name,
-                            'support': [support_entry],
-                            'query': query_entries,
-                        }
-                    )
+                )
 
         return episodes
 
@@ -365,26 +467,24 @@ class FewShotSegmentationDataset(Dataset):
         print(f"[WARN] skip sample '{image_stem}' because multi-channel mask not found in {masks_dir}")
         return None
 
-    def _load_multi_channel_mask(self, mask_path: str) -> List[Image.Image]:
-        arr = np.array(Image.open(mask_path))
-        channels = []
-        if arr.ndim == 2:  # 单通道标签图，数值表示部件ID
-            max_label = int(arr.max())
-            for label in range(max_label + 1):
-                channel = (arr == label).astype(np.uint8) * 255
-                channels.append(Image.fromarray(channel))
-        elif arr.ndim == 3:  # 多通道掩码
-            for idx in range(arr.shape[2]):
-                channel = arr[..., idx]
-                if channel.dtype != np.uint8:
-                    channel = (channel > 0).astype(np.uint8) * 255
-                else:
-                    channel = (channel > 0).astype(np.uint8) * 255
-                channels.append(Image.fromarray(channel))
-        else:
-            raise ValueError(f'Unsupported mask format for {mask_path}, array shape {arr.shape}')
+    def _resolve_episodes_per_epoch(self, requested: Optional[int]) -> int:
+        """Resolve how many episodes should be generated per epoch for training."""
 
-        return channels
+        total_available = len(self.train_episode_pool)
+        if requested is None:
+            return total_available
+
+        try:
+            value = int(requested)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f'episodes must be an integer, got {requested!r}'
+            ) from exc
+
+        if value <= 0:
+            return total_available
+
+        return value
 
     # 基于配置构建train/val/test子类划分
     def _build_subclass_partitions(self) -> dict:
@@ -440,13 +540,14 @@ class FewShotSegmentationDataset(Dataset):
     # 返回总episode数量或每个epoch的采样量
     def __len__(self) -> int:
         if self.is_train:  # 训练阶段直接覆盖全部子类内的episode
-            return len(self.train_episode_pool)
+            return self.episodes_per_epoch or len(self.train_episode_pool)
         return len(self.eval_episodes)  # 验证/测试阶段遍历所有episode
 
     # 构建单个episode的支持集与查询集样本
     def __getitem__(self, idx: int):
         if self.is_train:
-            episode = self.train_episode_pool[idx]  # 直接按索引取出对应episode，确保覆盖完整子类
+            # 训练阶段允许带放回地随机挑选episode，提高子类覆盖率
+            episode = self._episode_rng.choice(self.train_episode_pool)
             support_entries = self._sample_entries(
                 episode['support'],
                 self.num_shots,
@@ -543,7 +644,7 @@ class FewShotSegmentationDataset(Dataset):
         if mask_mode == 'multi_channel':
             if not mask_paths:
                 raise ValueError(f"Entry {entry['image']} missing multi-channel mask path")
-            mask_imgs = self._load_multi_channel_mask(mask_paths[0])
+            mask_imgs = self.decode_multi_channel_mask(mask_paths[0])
         else:
             mask_imgs = [Image.open(mask_path).convert('L') for mask_path in mask_paths]
         return mask_imgs, mask_paths, mask_mode
@@ -886,3 +987,4 @@ def build_dataloader(cfg, split: str, is_train: bool):
     )
 
     return loader
+
