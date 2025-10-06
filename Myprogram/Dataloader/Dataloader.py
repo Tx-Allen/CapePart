@@ -731,8 +731,8 @@ class FewShotSegmentationDataset(Dataset):
                     )
                 else:
                     print(
-                        f"{prefix} WARN zero-area mask after downsample: {src_mask_path} "
-                        f"(part_idx={part_idx})"
+                        f"{prefix} WARN source mask empty before resize: {src_mask_path} "
+                        f"(part_idx={part_idx}); keeping zero placeholder so part顺序保持一致"
                     )
                 warned = True
 
