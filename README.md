@@ -94,3 +94,18 @@ PYTHONPATH=Myprogram python Myprogram/TestSingleEpisode.py \
 - 若 episode 中 support 与 query 的部件集合不一致，数据集会自动补零/裁剪并对齐通道，确保模型输入始终匹配。
 - 若缺少 episode JSON，可使用 `python -m tools.build_episode_json` 依据文件夹结构自动生成。
 - 数据根目录既可以直接按 `<ROOT>/<超类>/<子类>/images|masks` 排列，也可以包含显式的划分层级（例如 `<ROOT>/train/<超类>/<子类>/images|masks`）；加载器会优先进入与 `split` 对应的子目录收集子类。
+- 当 JSON 中混入了不同子类的 support/query 图像时，DataLoader 会自动过滤并仅保留与 support 同属一个子类的样本，防止训练时跨类配对。
+
+## 常见问题排查
+
+- **报错 `default_collate: batch must contain tensors ... found <class 'NoneType'>`**：
+  - 该错误来自 PyTorch `DataLoader` 的默认 collate 逻辑，表示批次中存在 `None` 值。早期版本在记录 support/query 部件对齐信息时，如果某个部件缺失会写入 `None` 占位符，从而在多进程加载时触发此异常。
+  - 当前版本已将此类占位符统一替换为 `-1`，既能保留对齐调试信息，也不会被 collate 视为非法类型。如仍遇到该报错，请检查是否加载了旧的缓存或本地修改，确保使用最新的 `Myprogram/Dataloader/Dataloader.py`。
+  - 若日志中伴随 `WARN source mask empty before resize` 或 `WARN mask below min-area threshold after downsample`，说明该通道要么在源图中为空，要么在缩放后像素过少。这类样本会自动补零，不影响训练流程，但建议复核原始掩码与阈值设置以确认是否符合预期。
+- **日志反复提示 `WARN source mask empty before resize`**：
+  - DataLoader 会先读取原始掩码 → 最近邻缩放至 `DATASET.IMG_SIZE` → 触发 `EpisodeAugmentor.refine_mask_tensor` 的最小面积/随机擦除逻辑 → 最后检查像素面积。
+  - 警告信息会区分三类来源：
+    - `source mask empty before resize`：多通道 PNG 中该通道本身就是全零，我们保留零张量只是为了维持部件顺序；后续对齐阶段会根据 query 的真实通道补齐或裁剪，无需担心顺序错乱。
+    - `mask below min-area threshold after downsample`：掩码存在但像素少于 `DATASET.MIN_MASK_AREA` 设定；查询样本会被清零以避免噪声，可通过下调阈值（设为 0 即完全关闭）或增大输入尺寸缓解。
+    - `min-area threshold cleared support mask; restored original`：support 掩码像素虽低但已自动恢复为缩放前的结果，不会影响后续对齐，只是提示阈值过严。
+  - 若需要进一步保留细节，可适当提高 `DATASET.IMG_SIZE` 或在数据准备阶段对关键部件进行上采样/膨胀处理。

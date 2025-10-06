@@ -11,6 +11,8 @@ from PIL import Image  # 处理图像读写与格式转换
 import torch  # 深度学习张量库
 from torch.utils.data import Dataset  # PyTorch数据集基类
 from torchvision import transforms  # 常用图像预处理工具
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms import functional as F
 
 from utils import mask_area  # 掩码面积计算工具
 from Dataloader.augmentations import EpisodeAugmentor
@@ -237,6 +239,7 @@ class FewShotSegmentationDataset(Dataset):
 
         self.to_tensor = self.build_image_transform(img_size, mean, std)
         self.mask_to_tensor = self.build_mask_transform(img_size)
+        self.img_size = int(img_size)
 
         # 元学习相关的增强配置，用于提升support->query泛化
         aug_cfg = getattr(cfg, 'AUG', None)
@@ -321,14 +324,47 @@ class FewShotSegmentationDataset(Dataset):
             resolved_support = [self._resolve_entry(item) for item in support_set]
             resolved_query = [self._resolve_entry(item) for item in query_set]
 
+            support_subclasses = {self._entry_subclass_name(entry) for entry in resolved_support}
+            support_subclasses.discard('')
+
+            if episode.get('subclass'):
+                target_subclass = episode['subclass']
+            elif len(support_subclasses) == 1:
+                target_subclass = next(iter(support_subclasses))
+            elif support_subclasses:
+                target_subclass = sorted(support_subclasses)[0]
+            else:
+                target_subclass = 'default'
+
+            filtered_support = [entry for entry in resolved_support if self._entry_subclass_name(entry) == target_subclass]
+            filtered_query = [entry for entry in resolved_query if self._entry_subclass_name(entry) == target_subclass]
+
+            if not filtered_support or not filtered_query:
+                print(
+                    f"[WARN] Skip episode_{idx} because subclass '{target_subclass}' lacks both support and query samples in JSON."
+                )
+                continue
+
+            if (len(filtered_support) != len(resolved_support)) or (len(filtered_query) != len(resolved_query)):
+                print(
+                    f"[WARN] Episode {episode.get('episode_id', f'episode_{idx}')} contains cross-subclass entries;"
+                    f" only subclass '{target_subclass}' will be used."
+                )
+
             self.episodes.append(
                 {
                     'episode_id': episode.get('episode_id', f'episode_{idx}'),
-                    'subclass': episode.get('subclass'),
-                    'support': resolved_support,
-                    'query': resolved_query,
+                    'subclass': target_subclass,
+                    'support': filtered_support,
+                    'query': filtered_query,
                 }
             )
+
+    def _entry_subclass_name(self, entry: dict) -> str:
+        try:
+            return self._infer_subclass_from_path(Path(entry['image']))
+        except Exception:
+            return 'default'
 
     # 解析路径，支持绝对路径或相对路径
     def _resolve_path(self, path: str, default_dir: str) -> str:
@@ -664,13 +700,43 @@ class FewShotSegmentationDataset(Dataset):
         part_tensors = []
         warned = False
         for part_idx, mask_img in enumerate(mask_images):
-            tensor = self._mask_tensor(mask_img)
-            tensor = self.augmentor.refine_mask_tensor(tensor, is_support=is_support)
-            if mask_area(tensor) == 0:
+            tensor_before = self._mask_tensor(mask_img)
+            pre_area = float(mask_area(tensor_before).item()) if tensor_before.numel() > 0 else 0.0
+
+            tensor_after = self.augmentor.refine_mask_tensor(tensor_before, is_support=is_support)
+            post_area = float(mask_area(tensor_after).item()) if tensor_after.numel() > 0 else 0.0
+
+            reason = None
+            if post_area == 0.0:
+                if pre_area == 0.0:
+                    reason = 'source_empty'
+                else:
+                    reason = 'min_area_threshold'
+                    if is_support:
+                        tensor_after = tensor_before
+                        post_area = pre_area
+                        reason = 'restored_support_mask'
+
                 src_mask_path = mask_paths[0] if mask_mode == 'multi_channel' else mask_paths[min(part_idx, len(mask_paths) - 1)]
-                print(f"{prefix} WARN zero-area mask after downsample: {src_mask_path} (part_idx={part_idx})")
+
+                if reason == 'restored_support_mask':
+                    print(
+                        f"{prefix} WARN min-area threshold cleared support mask; restored original: {src_mask_path} "
+                        f"(part_idx={part_idx}, restored_pixels={int(pre_area)})"
+                    )
+                elif reason == 'min_area_threshold':
+                    print(
+                        f"{prefix} WARN mask below min-area threshold after downsample: {src_mask_path} "
+                        f"(part_idx={part_idx}, pixels={int(pre_area)}, threshold={self.min_mask_pixels})"
+                    )
+                else:
+                    print(
+                        f"{prefix} WARN source mask empty before resize: {src_mask_path} "
+                        f"(part_idx={part_idx}); keeping zero placeholder so part顺序保持一致"
+                    )
                 warned = True
-            part_tensors.append(tensor)
+
+            part_tensors.append(tensor_after)
         return part_tensors, warned
 
     def _ensure_part_consistency(self, expected_parts, part_tensors):
@@ -922,6 +988,9 @@ class FewShotSegmentationDataset(Dataset):
                 f" Query images: {query_image_names}"
             )
 
+        support_reorder_export = [idx if idx is not None else -1 for idx in support_reorder]
+        query_reorder_export = [idx if idx is not None else -1 for idx in query_reorder]
+
         info = {
             'support_parts_before': support_masks.shape[1],
             'query_parts_before': query_masks.shape[1],
@@ -929,8 +998,8 @@ class FewShotSegmentationDataset(Dataset):
             'aligned_parts': aligned_support.shape[1],
             'support_missing_parts': support_missing,
             'query_missing_parts': query_missing,
-            'support_reorder_indices': support_reorder,
-            'query_reorder_indices': query_reorder,
+            'support_reorder_indices': support_reorder_export,
+            'query_reorder_indices': query_reorder_export,
             'alignment_keys': [
                 {
                     'type': kind,
@@ -945,6 +1014,18 @@ class FewShotSegmentationDataset(Dataset):
     # 将掩码图转换为归一化张量
     def _mask_tensor(self, mask: Image.Image) -> torch.Tensor:
         tensor = self.mask_to_tensor(mask).float()  # 应用掩码预处理并转浮点
+        if tensor.max() == 0:
+            original = F.pil_to_tensor(mask).float()
+            has_foreground = bool(original.max() > 0)
+            if has_foreground:
+                resized = F.resize(
+                    original,
+                    [self.img_size, self.img_size],
+                    interpolation=InterpolationMode.BILINEAR,
+                    antialias=True,
+                )
+                if resized.max() > 0:
+                    tensor = (resized > 0).float()
         if tensor.max() > 0:
             tensor = tensor / tensor.max()  # 将掩码归一化到0-1区间
         return tensor.squeeze(0)  # 去掉单通道维度
