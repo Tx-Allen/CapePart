@@ -1,0 +1,17 @@
+yacs>=0.1.8
+torch>=1.12
+torchvision>=0.13
+
+
+# requirements.txt
+numpy>=1.23
+pillow>=10.0
+opencv-python>=4.8
+tqdm>=4.65
+pyyaml>=6.0                # 若配置用到 YAML
+yacs>=0.1.8                # 若 Config/default.py 用到 yacs
+tensorboard>=2.14
+scikit-image>=0.22         # 若做掩码形态学/读写
+matplotlib>=3.8            # 可选：可视化
+einops>=0.7.0              # 若 Transformer 中用到张量重排
+typing_extensions>=4.8
