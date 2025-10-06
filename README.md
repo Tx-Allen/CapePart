@@ -103,6 +103,9 @@ PYTHONPATH=Myprogram python Myprogram/TestSingleEpisode.py \
   - 当前版本已将此类占位符统一替换为 `-1`，既能保留对齐调试信息，也不会被 collate 视为非法类型。如仍遇到该报错，请检查是否加载了旧的缓存或本地修改，确保使用最新的 `Myprogram/Dataloader/Dataloader.py`。
   - 若日志中伴随 `WARN zero-area mask after downsample`，说明该部件在当前分辨率下被完全滤除。这类样本会自动补零，不影响训练流程，但建议复核原始掩码以确认是否存在标注缺失。
 - **日志反复提示 `WARN zero-area mask after downsample`**：
-  - 旧版在缩放掩码至 `DATASET.IMG_SIZE` 时，如果部件面积低于像素阈值会被直接清零，从而导致上述警告。
-  - 新版在检测到此情况时，会基于原始掩码重新进行双线性缩放并二值化，尽可能恢复细小部件；若仍为零，才会按缺失部件处理。
-  - 如需进一步保留细节，可适当提高 `DATASET.IMG_SIZE` 或在数据准备阶段对关键部件进行上采样/膨胀处理。
+  - DataLoader 会先读取原始掩码 → 最近邻缩放至 `DATASET.IMG_SIZE` → 触发 `EpisodeAugmentor.refine_mask_tensor` 的最小面积/随机擦除逻辑 → 最后检查像素面积。
+  - 警告信息会区分三类来源：
+    - `zero-area mask after downsample`：源掩码在读取阶段即为空，多半意味着该部件在原图中缺失或 JSON 中声明了多余通道。
+    - `mask below min-area threshold after downsample`：掩码存在但像素少于 `DATASET.MIN_MASK_AREA` 设定；查询样本会被清零以避免噪声，可通过下调阈值（设为 0 即完全关闭）或增大输入尺寸缓解。
+    - `min-area threshold cleared support mask; restored original`：support 掩码像素虽低但已自动恢复为缩放前的结果，不会影响后续对齐，只是提示阈值过严。
+  - 若需要进一步保留细节，可适当提高 `DATASET.IMG_SIZE` 或在数据准备阶段对关键部件进行上采样/膨胀处理。

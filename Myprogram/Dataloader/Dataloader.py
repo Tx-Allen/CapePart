@@ -700,13 +700,43 @@ class FewShotSegmentationDataset(Dataset):
         part_tensors = []
         warned = False
         for part_idx, mask_img in enumerate(mask_images):
-            tensor = self._mask_tensor(mask_img)
-            tensor = self.augmentor.refine_mask_tensor(tensor, is_support=is_support)
-            if mask_area(tensor) == 0:
+            tensor_before = self._mask_tensor(mask_img)
+            pre_area = float(mask_area(tensor_before).item()) if tensor_before.numel() > 0 else 0.0
+
+            tensor_after = self.augmentor.refine_mask_tensor(tensor_before, is_support=is_support)
+            post_area = float(mask_area(tensor_after).item()) if tensor_after.numel() > 0 else 0.0
+
+            reason = None
+            if post_area == 0.0:
+                if pre_area == 0.0:
+                    reason = 'source_empty'
+                else:
+                    reason = 'min_area_threshold'
+                    if is_support:
+                        tensor_after = tensor_before
+                        post_area = pre_area
+                        reason = 'restored_support_mask'
+
                 src_mask_path = mask_paths[0] if mask_mode == 'multi_channel' else mask_paths[min(part_idx, len(mask_paths) - 1)]
-                print(f"{prefix} WARN zero-area mask after downsample: {src_mask_path} (part_idx={part_idx})")
+
+                if reason == 'restored_support_mask':
+                    print(
+                        f"{prefix} WARN min-area threshold cleared support mask; restored original: {src_mask_path} "
+                        f"(part_idx={part_idx}, restored_pixels={int(pre_area)})"
+                    )
+                elif reason == 'min_area_threshold':
+                    print(
+                        f"{prefix} WARN mask below min-area threshold after downsample: {src_mask_path} "
+                        f"(part_idx={part_idx}, pixels={int(pre_area)}, threshold={self.min_mask_pixels})"
+                    )
+                else:
+                    print(
+                        f"{prefix} WARN zero-area mask after downsample: {src_mask_path} "
+                        f"(part_idx={part_idx})"
+                    )
                 warned = True
-            part_tensors.append(tensor)
+
+            part_tensors.append(tensor_after)
         return part_tensors, warned
 
     def _ensure_part_consistency(self, expected_parts, part_tensors):
