@@ -2,10 +2,40 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Set
 
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png'}
 MASK_EXTS = {'.png'}
+
+
+def _iter_leaf_dirs(root: Path):
+    seen: Set[Path] = set()
+    for images_dir in sorted(root.rglob('images')):
+        if not images_dir.is_dir():
+            continue
+        class_dir = images_dir.parent
+        if class_dir in seen:
+            continue
+        masks_dir = class_dir / 'maks'
+        if not masks_dir.exists():
+            masks_dir = class_dir / 'masks'
+        if not masks_dir.is_dir():
+            continue
+
+        try:
+            rel_parts = class_dir.relative_to(root).parts
+        except ValueError:
+            rel_parts = ()
+
+        if len(rel_parts) >= 2:
+            super_name = rel_parts[-2]
+        elif rel_parts:
+            super_name = root.name
+        else:
+            super_name = class_dir.parent.name if class_dir.parent != class_dir else root.name
+
+        seen.add(class_dir)
+        yield super_name, class_dir, images_dir, masks_dir
 
 
 @dataclass
@@ -31,40 +61,29 @@ def _find_mask_paths(masks_dir: Path, stem: str):
 def collect_samples(root: Path) -> List[SampleEntry]:
     root = root.resolve()
     samples: List[SampleEntry] = []
-    for super_dir in sorted(root.iterdir()):
-        if not super_dir.is_dir():
-            continue
-        for subclass_dir in sorted(super_dir.iterdir()):
-            if not subclass_dir.is_dir():
+    for super_name, subclass_dir, images_dir, masks_dir in _iter_leaf_dirs(root):
+        subclass = subclass_dir.name
+        for img_path in sorted(images_dir.iterdir()):
+            if not img_path.is_file() or img_path.suffix.lower() not in IMAGE_EXTS:
                 continue
-            images_dir = subclass_dir / 'images'
-            masks_dir = subclass_dir / 'maks'
-            if not masks_dir.exists():
-                masks_dir = subclass_dir / 'masks'
-            if not images_dir.is_dir() or not masks_dir.is_dir():
+            stem = img_path.stem
+            mask_paths, mode = _find_mask_paths(masks_dir, stem)
+            if mask_paths is None:
+                print(f"[WARN] Skip {img_path} because multi-channel mask not found")
                 continue
-
-            for img_path in sorted(images_dir.iterdir()):
-                if not img_path.is_file() or img_path.suffix.lower() not in IMAGE_EXTS:
-                    continue
-                stem = img_path.stem
-                mask_paths, mode = _find_mask_paths(masks_dir, stem)
-                if mask_paths is None:
-                    print(f"[WARN] Skip {img_path} because multi-channel mask not found")
-                    continue
-                rel_image = img_path.relative_to(root).as_posix()
-                rel_masks = [m.relative_to(root).as_posix() for m in mask_paths]
-                samples.append(
-                    SampleEntry(
-                        super_name=super_dir.name,
-                        subclass=subclass_dir.name,
-                        image_path=img_path,
-                        rel_image=rel_image,
-                        mask_paths=rel_masks,
-                        mask_mode=mode,
-                        stem=stem,
-                    )
+            rel_image = img_path.relative_to(root).as_posix()
+            rel_masks = [m.relative_to(root).as_posix() for m in mask_paths]
+            samples.append(
+                SampleEntry(
+                    super_name=super_name,
+                    subclass=subclass,
+                    image_path=img_path,
+                    rel_image=rel_image,
+                    mask_paths=rel_masks,
+                    mask_mode=mode,
+                    stem=stem,
                 )
+            )
     return samples
 
 
